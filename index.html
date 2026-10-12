@@ -103,7 +103,8 @@ h2 { margin:8px 0 7px; font-size:clamp(27px,4vw,39px); line-height:1.08; letter-
     </header>
     <section class="auth-panel" aria-label="Account and sync">
       <div class="auth-row"><div><b id="authTitle">Cloud sync (optional)</b><div class="auth-message" id="authStatus">Your existing subscriptions are saved in this browser. Sign in to sync across devices.</div></div><div class="auth-buttons"><button class="btn secondary" id="authToggle">Sign in / Sign up</button><button class="btn secondary" id="signOutBtn" hidden>Sign out</button><button class="btn secondary" id="importBtn" hidden>Import this browser's subscriptions</button></div></div>
-      <form id="authForm" class="auth-form" hidden><input type="email" id="authEmail" autocomplete="email" placeholder="Email address" required><input type="password" id="authPassword" autocomplete="current-password" minlength="6" placeholder="Password (6+ characters)" required><button class="btn" type="submit" id="loginBtn">Sign in</button><button class="btn secondary" type="button" id="signupBtn">Create account</button></form>
+      <form id="authForm" class="auth-form" hidden><input type="email" id="authEmail" autocomplete="email" placeholder="Email address" required><input type="password" id="authPassword" autocomplete="current-password" minlength="6" placeholder="Password (6+ characters)" required><button class="btn" type="submit" id="loginBtn">Sign in</button><button class="btn secondary" type="button" id="signupBtn">Create account</button><button class="text-btn" type="button" id="forgotBtn">Forgot password?</button></form>
+      <form id="resetForm" class="auth-form" hidden><input id="newPassword" type="password" autocomplete="new-password" minlength="12" placeholder="New password (12+ characters)" required><input id="confirmPassword" type="password" autocomplete="new-password" minlength="12" placeholder="Confirm new password" required><button class="btn" type="submit">Update password</button></form>
     </section>
     <section class="hero">
       <div><div class="eyebrow">Your money, made clearer</div><h2>Stay on top of<br>every renewal.</h2><p class="subhead">One simple place to track recurring costs, spot upcoming payments, and stay in control of your subscriptions.</p></div>
@@ -151,6 +152,8 @@ let publishableKey = localStorage.getItem(CONFIG_KEY) || '';
 let session = null;
 let cloudMode = false;
 let localBackup = [];
+let recoveryMode = false;
+let recoveryAccessToken = null;
 const authHeaders = (token=null) => ({'apikey':publishableKey, 'Content-Type':'application/json', ...(token?{'Authorization':'Bearer '+token}:{})});
 async function api(path, opts={}) {
  const res=await fetch(SUPABASE_URL+path,{...opts,headers:{...authHeaders(session?.access_token),...(opts.headers||{})}});
@@ -180,7 +183,7 @@ async function cloudLoad(){
 }
 function updateAuthUI(){
  $('authTitle').textContent=cloudMode?'Cloud sync enabled':'Cloud sync (optional)';
- $('signOutBtn').hidden=!cloudMode;$('authToggle').hidden=cloudMode;$('authForm').hidden=true;
+ $('signOutBtn').hidden=!cloudMode;$('authToggle').hidden=cloudMode;if(!recoveryMode)$('authForm').hidden=true;
  $('importBtn').hidden=!cloudMode||!localBackup.length;
 }
 async function signOut(){
@@ -254,6 +257,40 @@ async function authenticate(kind){
 }
 $('authForm').addEventListener('submit',e=>{e.preventDefault();authenticate('signin');});
 $('signupBtn').addEventListener('click',()=>authenticate('signup'));
+$('forgotBtn').addEventListener('click',async()=>{
+ if(!keySetup())return;
+ const email=$('authEmail').value.trim();
+ if(!email){authMessage('Enter your email address first, then click Forgot password?');return;}
+ try{
+  await api('/auth/v1/recover',{method:'POST',body:JSON.stringify({email}),headers:{}});
+  authMessage('If that email has an account, a recovery email will arrive. Open its link on this website.');
+ }catch(err){authMessage('Could not request recovery: '+err.message);}
+});
+$('resetForm').addEventListener('submit',async e=>{
+ e.preventDefault();
+ const pass=$('newPassword').value;
+ if(pass.length<12 || pass!==$('confirmPassword').value){authMessage('Passwords must match and be at least 12 characters.');return;}
+ try{
+  const res=await fetch(SUPABASE_URL+'/auth/v1/user',{method:'PUT',headers:{'apikey':publishableKey,'Authorization':'Bearer '+recoveryAccessToken,'Content-Type':'application/json'},body:JSON.stringify({password:pass})});
+  const body=await res.json().catch(()=>({}));
+  if(!res.ok)throw new Error(body.msg||body.message||body.error_description||'Password update failed');
+  $('newPassword').value='';$('confirmPassword').value='';
+  recoveryMode=false;recoveryAccessToken=null;$('resetForm').hidden=true;
+  session=null;cloudMode=false;localStorage.removeItem(SESSION_KEY);updateAuthUI();
+  $('authForm').hidden=false;authMessage('Password changed successfully. Sign in with your new password.');
+ }catch(err){authMessage('Password reset failed: '+err.message);}
+});
+function checkRecoveryLink(){
+ const hash=new URLSearchParams(location.hash.slice(1));
+ if(hash.get('type')!=='recovery'||!hash.get('access_token'))return false;
+ recoveryAccessToken=hash.get('access_token');recoveryMode=true;
+ if(!keySetup()){authMessage('To reset your password, reload and enter your Supabase publishable key (not your password).');return true;}
+ history.replaceState(null,'',location.pathname+location.search);
+ $('resetForm').hidden=false;$('authForm').hidden=true;
+ authMessage('Recovery link verified. Enter a new password below.');
+ return true;
+}
+
 $('signOutBtn').addEventListener('click',signOut);
 $('importBtn').addEventListener('click',async()=>{
  if(!cloudMode||!localBackup.length)return;
@@ -264,7 +301,7 @@ $('importBtn').addEventListener('click',async()=>{
  catch(err){authMessage('Import failed: '+err.message);}
 });
 try{session=JSON.parse(localStorage.getItem(SESSION_KEY)||'null');}catch{session=null;}
-if(session&&publishableKey){localBackup=readLocal();cloudLoad().catch(e=>{authMessage('Could not load cloud data: '+e.message);signOut();});}
+if(!checkRecoveryLink() && session&&publishableKey){localBackup=readLocal();cloudLoad().catch(e=>{authMessage('Could not load cloud data: '+e.message);signOut();});}
 $('exportBtn').addEventListener('click',()=>{const csv=['Name,Price,Frequency,Next payment,Category',...subscriptions.map(s=>[s.name,s.price,s.frequency,s.date,s.category].map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(','))].join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='subzero-subscriptions.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);showToast('Backup CSV downloaded.');});
 render();
 </script>
